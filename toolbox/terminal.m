@@ -4,9 +4,11 @@ classdef (Sealed) terminal < handle
     %   t = terminal()                    — docked terminal with default name
     %   t = terminal(Name="Build")        — docked terminal with custom name
     %   t = terminal(WindowStyle="normal") — undocked terminal in its own window
+    %   t = terminal(StartupCommand="make build") — run a command on startup
     %   t = terminal(Agent="claude")       — full agent integration with MathWorks toolkits
     %   t = terminal(Place="simulink")    — dock terminal in Simulink editor
     %   t = terminal(Model="MyModel")     — dock terminal in specific Simulink model
+    %   t.run("echo hello")              — run a command in an existing terminal
     %   delete(t)                         — closes the terminal and kills the server
     %
     %   Name-Value Arguments:
@@ -34,7 +36,7 @@ classdef (Sealed) terminal < handle
     %                   Simulink Agentic Toolkits, and registers with your AI
     %                   agent. First run prompts a setup wizard; preferences are
     %                   saved for subsequent runs. Default: false.
-    %     Agent       - "claude"|"amp"|"gemini"
+    %     Agent       - "claude"|"codex"|"amp"|"gemini"
     %                   Skips the wizard. Implies Agentic=true.
     %     Toolkits    - ["matlab"] or ["matlab","simulink"] (default includes
     %                   Simulink when installed), or ["simulink"] alone
@@ -52,6 +54,9 @@ classdef (Sealed) terminal < handle
     %     Tabs        - Enable multi-tab UI with tab bar and + button.
     %                   Default: false. Set to true for multiple terminal
     %                   sessions in a single window.
+    %     StartupCommand - Command to execute after the terminal starts.
+    %                   The command is sent with a trailing newline, as if
+    %                   typed and Enter pressed. Default: "" (none).
     %
     %   Static methods:
     %     terminal.version()  — return the installed toolbox version string
@@ -87,6 +92,8 @@ classdef (Sealed) terminal < handle
     %     t = terminal(Place="simulink");          % dock in active Simulink model
     %     t = terminal(Model="MyController");      % dock in specific model
     %     t = terminal(Tabs=true);    % enable multi-tab UI
+    %     t = terminal(StartupCommand="git status");  % run command on startup
+    %     t.run("ls -la");                  % run command after creation
     %     terminal.resetAgentOptions();
     %     delete(t);
     %     terminal.update();
@@ -113,7 +120,7 @@ classdef (Sealed) terminal < handle
         ThemeConfig        % cached theme config for re-init on HTML reload
         MCPCommand         % command to pre-populate in the first terminal session
         InitTimer          % one-shot timer for deferred post-constructor init
-        MCPTimer           % one-shot timer for delayed MCP hint
+        StartupInputTimer  % one-shot timer for delayed startup input
         ThemePollCount double = 0  % tick counter for periodic theme check
         LastFigureColor    % cached groot DefaultFigureColor for change detection
         ConsecutivePollFailures double = 0  % poll failure counter for server death detection
@@ -122,6 +129,9 @@ classdef (Sealed) terminal < handle
         DDGStudio              % DAS.Studio handle (Simulink mode only)
         SimulinkURL string = ""  % URL for DDG webbrowser widget
         Tabs logical = false  % whether multi-tab UI is enabled
+        SessionIds cell = {}   % active session IDs (ordered by creation)
+        StartupCommand string = ""  % command to run after first session is created
+        ConnectionDetailsJSON string = ""  % JSON for MW_MCP_SERVER_MATLAB_SESSION_CONNECTION_DETAILS
     end
 
     properties (SetAccess = private)
@@ -138,6 +148,7 @@ classdef (Sealed) terminal < handle
         SERVER_BINARY_NAME = 'matlab-terminal-server'
         POLL_INTERVAL = 0.1         % 100ms polling interval
         THEME_CHECK_TICKS = 50     % check theme every 50 ticks (5 seconds)
+        ENTER_KEY = char(13)       % CR — what a real terminal sends for Enter
         TOOLBOX_ID = '9e8f4a2b-3c1d-4e5f-a6b7-8c9d0e1f2a3b'
         GITHUB_REPO = 'matlab/terminal-in-matlab'
         MCP_SERVER_BINARY = 'matlab-mcp-core-server'
@@ -146,7 +157,7 @@ classdef (Sealed) terminal < handle
         % Agentic Toolkit constants
         AGENTIC_MATLAB_REPO = 'matlab/matlab-agentic-toolkit'
         AGENTIC_SIMULINK_REPO = 'matlab/simulink-agentic-toolkit'
-        AGENTIC_SUPPORTED_AGENTS = ["claude","amp","gemini"]
+        AGENTIC_SUPPORTED_AGENTS = ["claude","codex","amp","gemini"]
     end
 
     methods
@@ -165,6 +176,7 @@ classdef (Sealed) terminal < handle
                 options.Toolkits (1,:) string = string.empty
                 options.AgentCLI (1,1) string = ""
                 options.Tabs (1,1) logical = false
+                options.StartupCommand (1,1) string = ""
             end
 
             % --- Model implies Place="simulink" ---
@@ -202,6 +214,10 @@ classdef (Sealed) terminal < handle
                 options.Agentic = true;
             end
             if options.Agentic
+                if isMATLABReleaseOlderThan("R2023a")
+                    error('Terminal:UnsupportedRelease', ...
+                        'Agentic mode requires MATLAB R2023a or newer.');
+                end
                 config = terminal.readAgenticConfig();
 
                 isFirstRun = ~isfield(config, 'mcpServerVersion') ...
@@ -212,23 +228,6 @@ classdef (Sealed) terminal < handle
                     serverBin = terminal.ensureMCPServerBinary(config);
                     terminal.runSetupMatlabIfNeeded(serverBin);
                 end
-
-                % Always: share the MATLAB session.
-                % If shareMATLABSession is missing (toolbox uninstalled or new
-                % MATLAB release), attempt to reinstall it.
-                if isempty(which('shareMATLABSession'))
-                    if ~exist('serverBin', 'var')
-                        serverBin = terminal.ensureMCPServerBinary(config);
-                    end
-                    terminal.runSetupMatlabIfNeeded(serverBin);
-                end
-                try
-                    shareMATLABSession();
-                catch me
-                    error('Terminal:MCPShareFailed', ...
-                        'Failed to share MATLAB session:\n  %s', me.message);
-                end
-                fprintf('MATLAB session shared for AI agent access.\n\n');
 
                 % Resolve requested agent and toolkits.
                 % Priority: explicit option > config > wizard/default.
@@ -298,9 +297,9 @@ classdef (Sealed) terminal < handle
                     extensionFiles = terminal.collectExtensionFiles(requestedToolkits, toolkitPaths);
                     terminal.mergeMarketplace(toolkitPaths);
 
-                    if options.AgentCLI ~= "" && requestedAgent ~= "claude"
+                    if options.AgentCLI ~= "" && ~ismember(requestedAgent, ["claude", "codex"])
                         warning('Terminal:AgentCLIIgnored', ...
-                            'AgentCLI is only supported for Agent="claude". It will be ignored.');
+                            'AgentCLI is only supported for Agent="claude" and Agent="codex". It will be ignored.');
                         options.AgentCLI = "";
                     end
                     agentCLI = terminal.resolveAgentCLI( ...
@@ -351,6 +350,11 @@ classdef (Sealed) terminal < handle
                 end
             end
 
+            % --- Initial command to run after first session starts ---
+            if options.StartupCommand ~= ""
+                obj.StartupCommand = options.StartupCommand;
+            end
+
             % --- Auth token (32-char hex, cryptographically random) ---
             obj.AuthToken = terminal.generateToken();
 
@@ -375,6 +379,15 @@ classdef (Sealed) terminal < handle
                     'Could not find index.html at:\n  %s', htmlFile);
             end
 
+            % --- MATLAB connection details for MCP servers ---
+            % Set unconditionally so any MCP server launched from the
+            % terminal connects to this MATLAB instance.
+            try
+                obj.ConnectionDetailsJSON = terminal.getSessionConnectionDetails();
+            catch
+                % Pre-R2023a or connector unavailable — skip silently.
+            end
+
             % --- Build environment info ---
             matlabPid = num2str(feature('getpid'));
             matlabRoot = matlabroot;
@@ -395,9 +408,14 @@ classdef (Sealed) terminal < handle
                 args = sprintf('%s --env "LANG=%s"', args, lang);
             end
 
-            % Pass the token via environment variable so it is not visible
-            % in the process list (ps, tasklist, /proc/*/cmdline).
+            % Pass the token and connection details via process environment
+            % so they are not visible in the process list and avoid
+            % shell-quoting issues with JSON.
             setenv('MATLAB_TERMINAL_TOKEN', obj.AuthToken);
+            if obj.ConnectionDetailsJSON ~= ""
+                setenv('MW_MCP_SERVER_MATLAB_SESSION_CONNECTION_DETAILS', ...
+                    obj.ConnectionDetailsJSON);
+            end
 
             logFile = [tempname, '.log'];
             if ispc
@@ -415,8 +433,11 @@ classdef (Sealed) terminal < handle
                 system(sprintf('/bin/sh -c ''%s''', cmd));
             end
 
-            % Clear the env var so it's not inherited by other processes.
+            % Clear env vars so they're not inherited by other processes.
             setenv('MATLAB_TERMINAL_TOKEN', '');
+            if obj.ConnectionDetailsJSON ~= ""
+                unsetenv('MW_MCP_SERVER_MATLAB_SESSION_CONNECTION_DETAILS');
+            end
 
             % Wait for the server to write PID and PORT to the ready file.
             % The server writes and closes this file immediately, so there
@@ -514,6 +535,45 @@ classdef (Sealed) terminal < handle
             dlg.IsScrollable    = false;
         end
 
+        function run(obj, cmd)
+            %RUN Execute a command in the terminal.
+            %   t.run("echo hello") sends the command string followed by a
+            %   newline to the active terminal session, as if the user typed
+            %   it and pressed Enter.
+            %
+            %   When multiple tabs are open, the command is sent to the most
+            %   recently created session.
+            %
+            %   If the terminal is still loading, run() waits up to 5
+            %   seconds for the session to become available.
+            %
+            %   Examples:
+            %     t.run("ls -la")
+            %     t.run("echo 'hello world'")
+            %     t.run('echo "hello world"')       % char vector avoids "" escaping
+            %     t.run("grep ""pattern"" file.txt") % doubled quotes for shell "
+            %     t.run(sprintf('cd "%s"', myPath))  % programmatic construction
+            arguments
+                obj
+                cmd (1,1) string
+            end
+            if isempty(obj.SessionIds)
+                timeout = 5;
+                elapsed = 0;
+                while isempty(obj.SessionIds) && elapsed < timeout
+                    drainqueue(obj);
+                    pause(0.1);
+                    elapsed = elapsed + 0.1;
+                end
+                if isempty(obj.SessionIds)
+                    error('Terminal:NoSession', ...
+                        'No active terminal session after waiting %.1f seconds.', timeout);
+                end
+            end
+            sid = obj.SessionIds{end};
+            obj.serverPost('/api/input', struct('id', sid, 'data', cmd + obj.ENTER_KEY));
+        end
+
         function delete(obj)
             %DELETE Clean up: stop timer, kill server, close figure.
             terminal.registry('remove', obj);
@@ -525,9 +585,9 @@ classdef (Sealed) terminal < handle
                 stop(obj.PollTimer);
                 delete(obj.PollTimer);
             end
-            if ~isempty(obj.MCPTimer) && isvalid(obj.MCPTimer)
-                stop(obj.MCPTimer);
-                delete(obj.MCPTimer);
+            if ~isempty(obj.StartupInputTimer) && isvalid(obj.StartupInputTimer)
+                stop(obj.StartupInputTimer);
+                delete(obj.StartupInputTimer);
             end
             if ~isempty(obj.ServerProcess) && isstruct(obj.ServerProcess) ...
                     && isfield(obj.ServerProcess, 'pid') && ~isnan(obj.ServerProcess.pid)
@@ -553,6 +613,13 @@ classdef (Sealed) terminal < handle
     end
 
     methods (Access = private)
+        function drainqueue(~)
+            %DRAINQUEUE Process pending MATLAB event queue callbacks.
+            %   Required so that the HTMLComponent DataChanged/event callback
+            %   fires during a blocking wait loop.
+            drawnow limitrate
+        end
+
         function initMATLABPanel(obj, parent, options, htmlFile)
             %INITMATLABPANEL Standard uihtml-based terminal in a MATLAB figure.
 
@@ -1032,6 +1099,7 @@ classdef (Sealed) terminal < handle
                     createReq = struct('cols', 80, 'rows', 24, 'shell', obj.Shell);
                     resp = obj.serverPost('/api/create', createReq);
                     if ~isempty(resp) && isfield(resp, 'id')
+                        obj.SessionIds{end+1} = resp.id;
                         obj.sendToJS(struct('type', 'created', 'id', resp.id));
                         % Pre-populate MCP registration command in the
                         % first session. Delayed so the shell prompt is
@@ -1040,9 +1108,16 @@ classdef (Sealed) terminal < handle
                             sid = resp.id;
                             cmd = obj.MCPCommand;
                             obj.MCPCommand = [];  % only for the first session
-                            obj.MCPTimer = timer('StartDelay', 1.0, ...
-                                'TimerFcn', @(t,~) obj.sendMCPHint(t, sid, cmd));
-                            start(obj.MCPTimer);
+                            obj.StartupInputTimer = timer('StartDelay', 1.0, ...
+                                'TimerFcn', @(t,~) obj.sendStartupInput(t, sid, cmd));
+                            start(obj.StartupInputTimer);
+                        elseif obj.StartupCommand ~= ""
+                            sid = resp.id;
+                            cmd = obj.StartupCommand + obj.ENTER_KEY;
+                            obj.StartupCommand = "";  % only for the first session
+                            obj.StartupInputTimer = timer('StartDelay', 1.0, ...
+                                'TimerFcn', @(t,~) obj.sendStartupInput(t, sid, cmd));
+                            start(obj.StartupInputTimer);
                         end
                     end
                 case 'input'
@@ -1050,6 +1125,7 @@ classdef (Sealed) terminal < handle
                 case 'resize'
                     obj.serverPost('/api/resize', struct('id', msg.id, 'cols', msg.cols, 'rows', msg.rows));
                 case 'close'
+                    obj.SessionIds(strcmp(obj.SessionIds, msg.id)) = [];
                     obj.serverPost('/api/close', struct('id', msg.id));
                 case 'state'
                     obj.serverPost('/api/state', struct('id', msg.id, 'state', msg.data));
@@ -1084,11 +1160,11 @@ classdef (Sealed) terminal < handle
             resp = webwrite(url, data, obj.WriteOpts);
         end
 
-        function sendMCPHint(obj, tmr, sessionId, cmd)
-            %SENDMCPHINT Pre-populate MCP registration command in a session.
+        function sendStartupInput(obj, tmr, sessionId, cmd)
+            %SENDSTARTUPINPUT Send startup command to a session after delay.
             stop(tmr);
             delete(tmr);
-            obj.MCPTimer = [];
+            obj.StartupInputTimer = [];
             if ~isvalid(obj)
                 return;
             end
@@ -1847,6 +1923,37 @@ classdef (Sealed) terminal < handle
             end
         end
 
+        function connectionDetailsJSON = getSessionConnectionDetails()
+            %GETSESSIONCONNECTIONDETAILS Get JSON for pinning MCP server to this MATLAB.
+            %   Returns the JSON string for MW_MCP_SERVER_MATLAB_SESSION_CONNECTION_DETAILS
+            %   so the MCP core server connects to this specific MATLAB instance
+            %   rather than relying on the global shareMATLABSession registry.
+
+            if isMATLABReleaseOlderThan("R2023a")
+                try
+                    rel = matlabRelease.Release;
+                catch
+                    rel = "R" + version('-release');
+                end
+                error('Terminal:UnsupportedRelease', ...
+                    'Agentic mode requires MATLAB R2023a or newer (running %s).', rel);
+            end
+
+            apiKey = string(connector.internal.getConfig("apiKey"));
+            if apiKey == ""
+                % R2023a–R2024b: no auto-generated key, create one.
+                key = char(matlab.lang.internal.uuid());
+                connector.internal.setConfig("apiKey", key);
+                apiKey = string(connector.internal.getConfig("apiKey"));
+            end
+
+            details = struct( ...
+                'port', connector.securePort, ...
+                'apiKey', apiKey, ...
+                'certificate', string(connector.getCertificateLocation));
+            connectionDetailsJSON = jsonencode(details);
+        end
+
         function serverBin = ensureMCPServerBinary(config)
             %ENSUREMCPSERVERBINARY Find or download the MCP server binary.
             %   Installs to ~/.matlab/agentic-toolkits/bin/.
@@ -2149,8 +2256,8 @@ classdef (Sealed) terminal < handle
             fprintf('======================\n\n');
 
             % --- Agent selection ---
-            agents = ["claude", "amp", "gemini"];
-            labels = ["Claude Code", "Sourcegraph Amp", "Gemini CLI"];
+            agents = ["claude", "codex", "amp", "gemini"];
+            labels = ["Claude Code", "OpenAI Codex CLI", "Sourcegraph Amp", "Gemini CLI"];
             fprintf('Which AI agent are you using?\n');
             for i = 1:numel(agents)
                 fprintf('  [%d] %s\n', i, labels(i));
@@ -2553,14 +2660,8 @@ classdef (Sealed) terminal < handle
                     terminal.installGlobalSkills(toolkitPaths);
 
                 case "codex"
-                    codexCmd = 'codex';
-                    if agentCLI ~= "", codexCmd = char(agentCLI); end
-                    quotedArgs = cellfun(@(a) sprintf('"%s"', a), serverArgs, ...
-                        'UniformOutput', false);
-                    argsStr = strjoin(quotedArgs, ' ');
-                    cmd = sprintf('%s mcp add matlab -- "%s" %s', codexCmd, serverBin, argsStr);
+                    terminal.registerCodex(serverBin, serverArgs, agentCLI);
                     terminal.installGlobalSkills(toolkitPaths);
-                    fprintf('Run the command above in the terminal to register.\n\n');
 
 
                 case "copilot"
@@ -2892,6 +2993,85 @@ classdef (Sealed) terminal < handle
             cleanupObj = onCleanup(@() fclose(fid));
             fwrite(fid, jsonencode(config, 'PrettyPrint', true));
             fprintf('Claude Code: wrote MCP config to %s\n', configFile);
+        end
+
+        function registerCodex(serverBin, serverArgs, agentCLI)
+            %REGISTERCODEX Register MCP server with Codex CLI.
+            %   Uses `codex mcp add` if CLI is on PATH, otherwise falls back
+            %   to writing ~/.codex/config.json directly.
+
+            serverBin = strrep(char(serverBin), '\', '/');
+            nullDev = terminal.nullRedirect();
+            stdinNull = terminal.stdinRedirect();
+
+            if nargin < 3, agentCLI = ""; end
+
+            % Resolve the codex CLI command.
+            if agentCLI ~= ""
+                codexCmd = char(agentCLI);
+            else
+                codexCmd = 'codex';
+            end
+
+            % Check if codex CLI is available.
+            if agentCLI ~= ""
+                [cliStatus, ~] = system(sprintf('%s --version %s', codexCmd, nullDev));
+            elseif ispc
+                [cliStatus, ~] = system(sprintf('where %s %s', codexCmd, nullDev));
+            else
+                [cliStatus, ~] = system(sprintf('which %s %s', codexCmd, nullDev));
+            end
+
+            if cliStatus == 0
+                % Remove stale entry first.
+                system(sprintf('%s mcp remove matlab %s', codexCmd, nullDev));
+
+                % Register via CLI.
+                quotedArgs = cellfun(@(a) sprintf('"%s"', a), serverArgs, ...
+                    'UniformOutput', false);
+                argsStr = strjoin(quotedArgs, ' ');
+                cmd = sprintf('%s mcp add matlab -- "%s" %s %s', ...
+                    codexCmd, serverBin, argsStr, stdinNull);
+                [status, output] = system(cmd);
+                if status ~= 0
+                    warning('Terminal:CodexConfigFailed', ...
+                        'Failed to configure Codex CLI:\n  %s\nFalling back to direct file write.', ...
+                        strtrim(output));
+                    terminal.writeCodexJson(serverBin, serverArgs);
+                else
+                    fprintf('Codex CLI: MCP server registered (via %s mcp add)\n', codexCmd);
+                end
+            else
+                % CLI not available — write config directly.
+                terminal.writeCodexJson(serverBin, serverArgs);
+            end
+        end
+
+        function writeCodexJson(serverBin, serverArgs)
+            %WRITECODEXJSON Write MCP server config to ~/.codex/config.json.
+            home = terminal.userHome();
+            configDir = fullfile(home, '.codex');
+            configFile = fullfile(configDir, 'config.json');
+            if ~isfolder(configDir)
+                mkdir(configDir);
+            end
+            if isfile(configFile)
+                config = jsondecode(fileread(configFile));
+            else
+                config = struct();
+            end
+            if ~isfield(config, 'mcpServers')
+                config.mcpServers = struct();
+            end
+            args = serverArgs;
+            config.mcpServers.matlab = struct('command', serverBin, 'args', {args});
+            fid = fopen(configFile, 'w');
+            if fid == -1
+                error('Terminal:ConfigWriteFailed', 'Cannot write config: %s', configFile);
+            end
+            cleanupObj = onCleanup(@() fclose(fid));
+            fwrite(fid, jsonencode(config, 'PrettyPrint', true));
+            fprintf('Codex CLI: wrote MCP config to %s\n', configFile);
         end
 
         function installGlobalSkills(toolkitPaths)

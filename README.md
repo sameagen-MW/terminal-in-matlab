@@ -4,7 +4,7 @@
 
 Run a terminal in MATLAB®. Use the terminal to run command-line interface tools such AI coding agents, `git`, and `docker` without leaving the MATLAB desktop.
 
-<video src="https://github.com/user-attachments/assets/da4858b9-684f-43ad-9e66-bb64ab268d03" autoplay loop muted playsinline></video>
+![Terminal in MATLAB](images/terminal.png)
 
 ## Table of Contents
 
