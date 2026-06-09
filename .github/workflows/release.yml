@@ -6,9 +6,6 @@ on:
   push:
     tags: ["v*"]
 
-env:
-  MLM_LICENSE_TOKEN: ${{ secrets.MLM_LICENSE_TOKEN }}
-
 permissions:
   contents: write
 
@@ -91,7 +88,6 @@ jobs:
     with:
       base64-subjects: "${{ needs.build.outputs.digests }}"
       upload-assets: true
-      private-repository: true
 
   release:
     name: Create GitHub Release
