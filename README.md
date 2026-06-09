@@ -1,6 +1,7 @@
 # Terminal in MATLAB
 
-[![Open in MATLAB Online](https://www.mathworks.com/images/responsive/global/open-in-matlab-online.svg)](https://matlab.mathworks.com/open/github/v1?repo=matlab/terminal-in-matlab&file=toolbox/doc/Install.m) &nbsp; [![Download Latest](https://img.shields.io/github/v/release/matlab/terminal-in-matlab?label=Download%20Latest&logo=github)](../../releases/latest/download/Terminal.mltbx)
+[![Open in MATLAB Online](https://www.mathworks.com/images/responsive/global/open-in-matlab-online.svg)](https://matlab.mathworks.com/open/github/v1?repo=matlab/terminal-in-matlab&file=toolbox/doc/Install.m) &nbsp; [![Download Latest](https://img.shields.io/github/v/release/matlab/terminal-in-matlab?label=Download%20Latest&logo=github)](../../releases/latest/download/Terminal.mltbx) &nbsp; ![GitHub Downloads](https://img.shields.io/github/downloads/matlab/terminal-in-matlab/total?label=Downloads&logo=github&color=blue)
+
 
 Run a terminal in MATLAB®. Use the terminal to run command-line interface tools such AI coding agents, `git`, and `docker` without leaving the MATLAB desktop.
 
