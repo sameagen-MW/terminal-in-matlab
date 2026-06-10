@@ -77,6 +77,7 @@ jobs:
     needs: build-server
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v6
       - uses: matlab-actions/setup-matlab@v3
       - uses: matlab-actions/run-build@v3
         with:
