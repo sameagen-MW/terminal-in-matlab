@@ -81,4 +81,4 @@ jobs:
       - uses: matlab-actions/setup-matlab@v3
       - uses: matlab-actions/run-build@v3
         with:
-          tasks: check, test
+          tasks: check test

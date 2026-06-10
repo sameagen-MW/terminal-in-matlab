@@ -50,7 +50,7 @@ jobs:
       - name: Build .mltbx
         uses: matlab-actions/run-build@v3
         with:
-          tasks: check, test, package("${{ github.ref_name }}")
+          tasks: check test package("${{ github.ref_name }}")
 
       - name: Compute checksums
         id: checksums
